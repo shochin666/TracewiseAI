@@ -1,20 +1,28 @@
-# ねじメッキ工程システムを Azure Container Apps へ自動デプロイする。
+# ねじメッキ工程システムを Azure Container Apps へ自動デプロイする（環境別）。
 #
-# 流れ:
-#   1. OIDC で Azure ログイン（シークレットレス）
-#   2. リソースグループ作成（冪等）
-#   3. 基盤デプロイ（ACR / ログ / ストレージ / Container Apps 環境 / pull用ID）
-#   4. backend の内部 FQDN を算出（フロントのプロキシ先＝ビルド時に焼き込む）
-#   5. ACR でイメージをビルド＆プッシュ（クラウドビルド。ローカル Docker 不要）
-#   6. アプリデプロイ（backend=内部 / frontend=公開）
+#   ブランチ           GitHub Environment   既定リソース
+#   develop  ─►        development          tracewise-dev-rg  / tracewise-dev-*
+#   main     ─►        production           tracewise-prod-rg / tracewise-prod-*  ※今は未使用
 #
-# 事前準備（1回だけ）: infra/setup-azure-oidc.sh を実行し、出力された値を
-#   GitHub の Secrets（AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID）に登録する。
+# 当面は開発(dev)環境のみ運用するため、トリガは develop ブランチのみ。
+# 本番(prod)を追加するときは:
+#   1) 下の branches に 'main' を追記
+#   2) GitHub Environment 'production' を作成し、Variables: RESOURCE_GROUP / NAME_PREFIX を設定
+#   3) ENVIRONMENT=production bash infra/setup-azure-oidc.sh を実行
+#
+# 事前準備（dev・1回だけ）:
+#   1) GitHub の Settings → Environments で 'development' を作成し、Variables を設定
+#         RESOURCE_GROUP = tracewise-dev-rg
+#         NAME_PREFIX    = tracewise-dev
+#   2) ENVIRONMENT=development bash infra/setup-azure-oidc.sh を実行
+#      → 出力された3値を Settings → Secrets and variables → Actions の
+#        Repository secrets に登録
+#         AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
 name: Deploy to Azure Container Apps
 
 on:
   push:
-    branches: [main]
+    branches: [develop] # prodを追加するときは ['develop', 'main'] に
     paths:
       - "backend/**"
       - "frontend/**"
@@ -27,13 +35,18 @@ permissions:
   contents: read
 
 env:
-  LOCATION: japaneast
-  RESOURCE_GROUP: tracewise-rg
-  NAME_PREFIX: tracewise
+  LOCATION: japaneast # 全環境共通
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # ブランチ → GitHub Environment マップ（main=production / それ以外=development）。
+    # 当面 main はトリガに含めないため develop だけが development を使う。
+    environment: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+    env:
+      # 環境ごとに分離（GitHub Environment の Variables から注入）。
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
     steps:
       - name: チェックアウト
         uses: actions/checkout@v4
@@ -44,6 +57,16 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 環境設定を確認
+        run: |
+          echo "Environment   : ${{ github.ref_name == 'main' && 'production' || 'development' }}"
+          echo "ResourceGroup : $RESOURCE_GROUP"
+          echo "NamePrefix    : $NAME_PREFIX"
+          [ -n "$RESOURCE_GROUP" ] && [ -n "$NAME_PREFIX" ] || {
+            echo "::error::GitHub Environment の Variables (RESOURCE_GROUP / NAME_PREFIX) が未設定です。"
+            exit 1
+          }
 
       - name: リソースグループ作成（冪等）
         run: az group create -n "$RESOURCE_GROUP" -l "$LOCATION" -o none
@@ -75,8 +98,8 @@ jobs:
         run: |
           az acr build \
             -r "${{ steps.platform.outputs.acrName }}" \
-            -t "tracewise-backend:${{ steps.vars.outputs.tag }}" \
-            -t "tracewise-backend:latest" \
+            -t "${NAME_PREFIX}-backend:${{ steps.vars.outputs.tag }}" \
+            -t "${NAME_PREFIX}-backend:latest" \
             -f backend/Dockerfile.prod \
             backend
 
@@ -86,8 +109,8 @@ jobs:
           # BACKEND_ORIGIN → Next.js の rewrites が backend(内部) へ中継する宛先（ビルド時に焼き込む）。
           az acr build \
             -r "${{ steps.platform.outputs.acrName }}" \
-            -t "tracewise-frontend:${{ steps.vars.outputs.tag }}" \
-            -t "tracewise-frontend:latest" \
+            -t "${NAME_PREFIX}-frontend:${{ steps.vars.outputs.tag }}" \
+            -t "${NAME_PREFIX}-frontend:latest" \
             -f frontend/Dockerfile.prod \
             --build-arg BACKEND_ORIGIN="${{ steps.vars.outputs.backendOrigin }}" \
             frontend
@@ -107,8 +130,8 @@ jobs:
                acrLoginServer="$loginServer" \
                pullIdentityId="${{ steps.platform.outputs.pullIdentityId }}" \
                envStorageName="${{ steps.platform.outputs.envStorageName }}" \
-               backendImage="$loginServer/tracewise-backend:$tag" \
-               frontendImage="$loginServer/tracewise-frontend:$tag" \
+               backendImage="$loginServer/${NAME_PREFIX}-backend:$tag" \
+               frontendImage="$loginServer/${NAME_PREFIX}-frontend:$tag" \
             --query properties.outputs -o json)
           echo "frontendUrl=$(echo "$outputs" | jq -r .frontendUrl.value)" >> "$GITHUB_OUTPUT"
 
@@ -117,6 +140,8 @@ jobs:
           {
             echo "### デプロイ完了 :rocket:"
             echo ""
+            echo "- Environment : \`${{ github.ref_name == 'main' && 'production' || 'development' }}\`"
+            echo "- ResourceGroup: \`$RESOURCE_GROUP\`"
             echo "- フロントエンド: ${{ steps.apps.outputs.frontendUrl }}"
-            echo "- イメージタグ: \`${{ steps.vars.outputs.tag }}\`"
+            echo "- イメージタグ : \`${{ steps.vars.outputs.tag }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

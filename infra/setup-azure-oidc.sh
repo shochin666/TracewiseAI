@@ -1,28 +1,48 @@
 #!/usr/bin/env bash
 # ============================================================
-#  GitHub Actions から Azure へ OIDC でデプロイするための初期設定（1回だけ実行）
+#  GitHub Actions から Azure へ OIDC でデプロイするための初期設定（環境ごとに1回）
 #
-#  実行すること:
-#   1. リソースグループを作成（ロールをここに限定するため）
-#   2. Entra アプリ登録 + サービスプリンシパルを作成（OIDC。シークレットは作らない）
+#  既定は「開発環境(development)」のセットアップ。本番(production) を追加するときは
+#  ENVIRONMENT=production を指定して再実行する（Entraアプリは共有・追加でロールと
+#  フェデレーション資格情報だけが作成される）。
+#
+#  この実行で行うこと:
+#   1. 環境別リソースグループを作成（例: tracewise-dev-rg / tracewise-prod-rg）
+#   2. Entra アプリ登録 + サービスプリンシパルを作成/再利用（OIDC・シークレット無し）
 #   3. リソースグループに Owner ロールを割り当て
 #      （apps.bicep が pull用IDへロール付与するため、roleAssignments 権限が必要）
-#   4. GitHub リポジトリ用のフェデレーション資格情報を登録（main ブランチ）
-#   5. GitHub Secrets に登録すべき値を出力（gh があれば自動登録も可）
+#   4. GitHub Environment 紐付けのフェデレーション資格情報を登録
+#      （subject: repo:OWNER/REPO:environment:<ENVIRONMENT>）
+#   5. GitHub Secrets に登録すべき値を出力
 #
-#  前提: az CLI 導入済み・'az login' 済み。
+#  前提:
+#    ・az CLI 導入済み・'az login' 済み
+#    ・実行の前に GitHub の Settings → Environments で対象 Environment
+#      （development / production）を作成し、Variables を設定しておくこと
+#         RESOURCE_GROUP = tracewise-dev-rg  / tracewise-prod-rg
+#         NAME_PREFIX    = tracewise-dev     / tracewise-prod
+#
 #  使い方:
 #     az login
-#     bash infra/setup-azure-oidc.sh
-#     # リポジトリを自動判定できない場合: GITHUB_REPO=org/repo bash infra/setup-azure-oidc.sh
+#     bash infra/setup-azure-oidc.sh                          # → development
+#     ENVIRONMENT=production bash infra/setup-azure-oidc.sh   # → production
+#     # リポジトリを自動判定できない場合: GITHUB_REPO=org/repo を追加
 # ============================================================
 set -euo pipefail
 
-# ---- 設定（環境変数で上書き可。deploy.yml の既定値と合わせている）----
-APP_NAME="${APP_NAME:-tracewise-github-oidc}"
-RESOURCE_GROUP="${RESOURCE_GROUP:-tracewise-rg}"
+# ---- 設定（環境変数で上書き可。deploy.yml の Environment Variables と合わせる）----
+ENVIRONMENT="${ENVIRONMENT:-development}"
+case "$ENVIRONMENT" in
+  development) ENV_SHORT="dev" ;;
+  production)  ENV_SHORT="prod" ;;
+  *)           ENV_SHORT="$ENVIRONMENT" ;;
+esac
+
+APP_NAME="${APP_NAME:-tracewise-github-oidc}"            # 全環境で共有する1つのEntraアプリ
+RESOURCE_GROUP="${RESOURCE_GROUP:-tracewise-${ENV_SHORT}-rg}"
+NAME_PREFIX="${NAME_PREFIX:-tracewise-${ENV_SHORT}}"
 LOCATION="${LOCATION:-japaneast}"
-GITHUB_REPO="${GITHUB_REPO:-}" # "org/repo" 形式。未指定なら git remote から推定。
+GITHUB_REPO="${GITHUB_REPO:-}"                            # "org/repo" 形式。未指定なら git remote から推定。
 
 # ---- 前提チェック ----
 command -v az >/dev/null 2>&1 || { echo "エラー: az CLI が見つかりません。"; exit 1; }
@@ -43,10 +63,12 @@ SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
 TENANT_ID="$(az account show --query tenantId -o tsv)"
 
 echo "============================================================"
+echo " Environment  : $ENVIRONMENT  (short: $ENV_SHORT)"
 echo " Subscription : $SUBSCRIPTION_ID"
 echo " Tenant       : $TENANT_ID"
 echo " Repository   : $GITHUB_REPO"
 echo " ResourceGroup: $RESOURCE_GROUP ($LOCATION)"
+echo " NamePrefix   : $NAME_PREFIX"
 echo " App 名        : $APP_NAME"
 echo "============================================================"
 
@@ -65,7 +87,7 @@ fi
 az ad sp show --id "$APP_ID" >/dev/null 2>&1 || az ad sp create --id "$APP_ID" -o none
 SP_OBJECT_ID="$(az ad sp show --id "$APP_ID" --query id -o tsv)"
 
-# ---- 3. ロール割り当て（リソースグループに Owner）----
+# ---- 3. ロール割り当て（このリソースグループに Owner）----
 az role assignment create \
   --assignee-object-id "$SP_OBJECT_ID" \
   --assignee-principal-type ServicePrincipal \
@@ -75,12 +97,13 @@ az role assignment create \
   && echo "[3/4] Owner ロールを割り当てました（scope: ${RESOURCE_GROUP}）。" \
   || echo "[3/4] Owner ロールは既に割り当て済みです。"
 
-# ---- 4. フェデレーション資格情報（main ブランチ）----
-SUBJECT="repo:${GITHUB_REPO}:ref:refs/heads/main"
+# ---- 4. フェデレーション資格情報（GitHub Environment 紐付け）----
+SUBJECT="repo:${GITHUB_REPO}:environment:${ENVIRONMENT}"
+FC_NAME="github-${ENV_SHORT}"
 EXISTS="$(az ad app federated-credential list --id "$APP_ID" --query "length([?subject=='$SUBJECT'])" -o tsv)"
 if [[ "$EXISTS" == "0" ]]; then
   az ad app federated-credential create --id "$APP_ID" --parameters "{
-    \"name\": \"github-main\",
+    \"name\": \"$FC_NAME\",
     \"issuer\": \"https://token.actions.githubusercontent.com\",
     \"subject\": \"$SUBJECT\",
     \"audiences\": [\"api://AzureADTokenExchange\"]
@@ -94,18 +117,27 @@ fi
 cat <<EOF
 
 ============================================================
- GitHub の Secrets に以下を登録してください
- （リポジトリ → Settings → Secrets and variables → Actions）
-------------------------------------------------------------
- AZURE_CLIENT_ID       = $APP_ID
- AZURE_TENANT_ID       = $TENANT_ID
- AZURE_SUBSCRIPTION_ID = $SUBSCRIPTION_ID
+ 次にやること
+============================================================
+ 1) GitHub の Settings → Environments で「${ENVIRONMENT}」を作成し、
+    Environment variables に以下を設定（未設定なら）:
+       RESOURCE_GROUP = ${RESOURCE_GROUP}
+       NAME_PREFIX    = ${NAME_PREFIX}
+
+ 2) GitHub の Settings → Secrets and variables → Actions の
+    Repository secrets に以下3つを登録（全環境共通・既登録ならスキップ）:
+       AZURE_CLIENT_ID       = $APP_ID
+       AZURE_TENANT_ID       = $TENANT_ID
+       AZURE_SUBSCRIPTION_ID = $SUBSCRIPTION_ID
+
+ 3) 該当ブランチへ push して自動デプロイ:
+       ${ENVIRONMENT} → $( [[ "$ENVIRONMENT" == "production" ]] && echo "git push origin main" || echo "git push origin develop" )
 ============================================================
 EOF
 
 # ---- gh があれば自動登録（任意）----
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  read -r -p "gh CLI で上記 Secrets を自動登録しますか? [y/N] " ans
+  read -r -p "gh CLI で上記 Repository Secrets を自動登録しますか? [y/N] " ans
   if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
     gh secret set AZURE_CLIENT_ID       -b "$APP_ID"           -R "$GITHUB_REPO"
     gh secret set AZURE_TENANT_ID       -b "$TENANT_ID"        -R "$GITHUB_REPO"
@@ -113,5 +145,3 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     echo "GitHub Secrets を登録しました。"
   fi
 fi
-
-echo "完了。次は 'git push origin main' で自動デプロイされます（または GitHub Actions を手動実行）。"

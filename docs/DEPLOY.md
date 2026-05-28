@@ -1,7 +1,15 @@
 # Azure へのデプロイ手順（CI/CD）
 
-`main` への push で **GitHub Actions → Azure Container Apps** に自動デプロイします。
+**ブランチごとに環境を分けて** `GitHub Actions → Azure Container Apps` に自動デプロイします。
 マネージドサービス中心・低コスト（無アクセス時は 0 スケール）の構成です。
+
+| ブランチ | GitHub Environment | リソースグループ | 名前接頭辞 |
+| --- | --- | --- | --- |
+| `develop` | `development` | `tracewise-dev-rg` | `tracewise-dev` |
+| `main` | `production` | `tracewise-prod-rg` | `tracewise-prod` ※当面未使用 |
+
+> 当面は **dev 環境のみ** 運用します（`develop` への push でデプロイ）。
+> prod 追加方法は「§10. prod環境を後から足す」を参照。
 
 ---
 
@@ -50,8 +58,15 @@
 
 ---
 
-## 3. 最初の1回だけ：OIDC初期設定
+## 3. 最初の1回だけ：dev環境のOIDC初期設定
 
+### 3-1. GitHub Environment を作る（Web UI）
+1. リポジトリの **Settings → Environments → New environment** で `development` を作成
+2. その Environment の **Variables** に2つ追加:
+   - `RESOURCE_GROUP` = `tracewise-dev-rg`
+   - `NAME_PREFIX` = `tracewise-dev`
+
+### 3-2. Azure側を作成（スクリプト1発）
 ```bash
 az login
 bash infra/setup-azure-oidc.sh
@@ -61,14 +76,16 @@ bash infra/setup-azure-oidc.sh
 
 スクリプトは次を行い、最後に GitHub Secrets 用の3つの値を出力します。
 
-1. リソースグループ作成（既定 `tracewise-rg` / `japaneast`）
-2. Entra アプリ登録＋サービスプリンシパル作成（OIDC）
+1. リソースグループ作成（dev は `tracewise-dev-rg` / `japaneast`）
+2. Entra アプリ登録＋サービスプリンシパル作成 or 再利用（OIDC）
 3. リソースグループへ **Owner** ロール割り当て
    （`apps.bicep` が pull用ID へロールを付与するため `roleAssignments/write` 権限が必要）
-4. `main` ブランチ用フェデレーション資格情報の登録
+4. **GitHub Environment 紐付け**のフェデレーション資格情報を登録
+   （subject = `repo:<owner>/<repo>:environment:development`）
 
-出力された値を GitHub の **Settings → Secrets and variables → Actions** に登録します
-（`gh` CLI があればスクリプトが自動登録もできます）。
+### 3-3. GitHub Secrets を登録（Web UI）
+**Settings → Secrets and variables → Actions → Repository secrets** に以下3つを登録
+（`gh` CLI があればスクリプトから自動登録も可）:
 
 | Secret | 内容 |
 | --- | --- |
@@ -80,26 +97,28 @@ bash infra/setup-azure-oidc.sh
 
 ---
 
-## 4. デプロイ
+## 4. デプロイ（dev環境）
 
 ```bash
-git push origin main
+git checkout -b develop      # 初回のみ。以降は develop で作業
+git push -u origin develop   # ブランチ作成＆push（以降 push のたびに自動デプロイ）
 ```
 
 `backend/**` `frontend/**` `infra/**` `.github/workflows/deploy.yml` の変更で起動します。
 GitHub の **Actions** タブから手動実行（Run workflow）も可能です。
 
 ### パイプラインの流れ
-1. OIDC で Azure ログイン
-2. リソースグループ作成（冪等）
-3. `platform.bicep` をデプロイ（基盤）
-4. backend の内部FQDN `tracewise-backend.internal.<env既定ドメイン>` を算出
-5. `az acr build` で backend / frontend をクラウドビルド＆プッシュ
-   - frontend は `--build-arg BACKEND_ORIGIN=<上記FQDN>` と `NEXT_PUBLIC_API_BASE_URL=`（空）を注入
-6. `apps.bicep` をデプロイ（アプリ2つ）
-7. 完了後、Actions のジョブサマリに **フロントエンドURL** を表示
+1. OIDC で Azure ログイン（環境ごとの federated credential を使用）
+2. GitHub Environment の Variables から `RESOURCE_GROUP` / `NAME_PREFIX` を取得
+3. リソースグループ作成（冪等）
+4. `platform.bicep` をデプロイ（基盤）
+5. backend の内部FQDN `<NAME_PREFIX>-backend.internal.<env既定ドメイン>` を算出
+6. `az acr build` で backend / frontend をクラウドビルド＆プッシュ
+   - frontend は `--build-arg BACKEND_ORIGIN=<上記FQDN>` を注入
+7. `apps.bicep` をデプロイ（アプリ2つ）
+8. 完了後、Actions のジョブサマリに **フロントエンドURL** を表示
 
-デプロイ完了後、表示された `https://tracewise-frontend.<...>.azurecontainerapps.io` を開けば動作します。
+デプロイ完了後、表示された `https://<NAME_PREFIX>-frontend.<...>.azurecontainerapps.io` を開けば動作します。
 
 ---
 
@@ -168,7 +187,27 @@ docker run --rm -p 8000:8000 tracewise-backend:local
 ## 9. 後片付け（課金を止める）
 
 ```bash
-az group delete -n tracewise-rg --yes --no-wait
+az group delete -n tracewise-dev-rg --yes --no-wait     # dev環境を完全削除
+# prod を運用中なら:
+#   az group delete -n tracewise-prod-rg --yes --no-wait
 ```
 
 リソースグループごと削除すれば、関連リソース（ACA・ACR・ストレージ・ログ）がまとめて消えます。
+
+---
+
+## 10. prod環境を後から足す
+
+dev で慣れたら最小手数で本番を増設できます（Bicepは同じ・接頭辞だけ違う）。
+
+1. **GitHub Environment 作成**：`Settings → Environments → New environment` で `production` を作成
+   - **Deployment branches**: `main` のみに制限
+   - **Required reviewers**: 自分を指定（push時に手動承認が要るようにすると安全）
+   - **Variables** に `RESOURCE_GROUP = tracewise-prod-rg` / `NAME_PREFIX = tracewise-prod` を設定
+2. **Azure側**:
+   ```bash
+   ENVIRONMENT=production bash infra/setup-azure-oidc.sh
+   ```
+   （Entraアプリは共有。prod用RGとフェデレーション資格情報だけが追加される）
+3. **ワークフローを有効化**：`.github/workflows/deploy.yml` の `branches: [develop]` を `branches: [develop, main]` に変更してコミット
+4. **昇格**：`develop` → `main` への PR をマージ → 承認 → prod自動デプロイ
