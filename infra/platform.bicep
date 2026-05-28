@@ -21,8 +21,14 @@ param namePrefix string = 'tracewise'
 
 // グローバル一意名を決め打ちで生成（ユーザーが一意名を考えなくてよいように）。
 var suffix = uniqueString(resourceGroup().id)
-var acrName = '${namePrefix}${suffix}' // 例: tracewiseabc123... (英数小文字, <=50)
-var storageAccountName = '${namePrefix}${suffix}' // 英数小文字, <=24（種別が違うので名前衝突しない）
+// ACR と Storage Account は「英数小文字のみ・ハイフン不可」のため、namePrefix のハイフンを除去する。
+// 例: namePrefix='tracewise-dev' → cleanPrefix='tracewisedev'
+var cleanPrefix = toLower(replace(namePrefix, '-', ''))
+// ACR: 5〜50文字、英数小文字
+var acrName = '${cleanPrefix}${suffix}'
+// Storage Account: 3〜24文字、英数小文字。24を超える場合は末尾を切り詰めて収める。
+var rawStorageName = '${cleanPrefix}${suffix}'
+var storageAccountName = length(rawStorageName) > 24 ? substring(rawStorageName, 0, 24) : rawStorageName
 var fileShareName = 'tracewise-data'
 var envStorageName = 'tracewisedata' // Container Apps 環境ストレージ名（英数小文字）
 
