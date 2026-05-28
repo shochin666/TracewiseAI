@@ -25,13 +25,27 @@ def _ensure_parent_dir(path: str) -> None:
 
 
 def get_connection() -> sqlite3.Connection:
-    """sqlite3 接続を生成する。row_factory により dict ライクにアクセスできる。"""
+    """sqlite3 接続を生成する。row_factory により dict ライクにアクセスできる。
+
+    Azure Files(SMB) 上で SQLite を運用する想定。SMB のバイトレンジロック挙動が
+    POSIX と異なり、SQLite の通常のロック獲得が "database is locked" になりがち
+    （特にスキーマ初期化時）。対策として nolock=1 で OS ファイルロックを無効化する。
+
+    安全性の前提（必須）:
+      - ACA で minReplicas/maxReplicas=1（単一プロセス）
+      - uvicorn は --workers 1（単一インタプリタ）
+    この前提が崩れる場合は DB 破損の恐れがあるため、必ず守ること。
+    """
     _ensure_parent_dir(DB_PATH)
+    # nolock=1 + URI 接続
+    uri = f"file:{DB_PATH}?nolock=1"
     # check_same_thread=False: FastAPIの同期エンドポイントはスレッドプールで実行され、
     # 依存性(get_db_session)の生成と finally のクローズが別スレッドになり得るため。
     # リクエストごとに別接続を開く設計なので、無効化しても安全。
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    # busy_timeout: BUSY 時のリトライ待機（保険）
+    conn.execute("PRAGMA busy_timeout = 30000;")
     # 外部キー制約を有効化
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
