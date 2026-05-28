@@ -1,0 +1,15 @@
+# ホスト側の生成物はイメージに含めない（コンテナ内で clean install / build する）
+node_modules
+.next
+out
+*.tsbuildinfo
+
+# 環境・メタ
+.env.local
+.env.*.local
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+npm-debug.log*

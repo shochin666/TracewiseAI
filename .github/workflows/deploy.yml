@@ -1,0 +1,122 @@
+# ねじメッキ工程システムを Azure Container Apps へ自動デプロイする。
+#
+# 流れ:
+#   1. OIDC で Azure ログイン（シークレットレス）
+#   2. リソースグループ作成（冪等）
+#   3. 基盤デプロイ（ACR / ログ / ストレージ / Container Apps 環境 / pull用ID）
+#   4. backend の内部 FQDN を算出（フロントのプロキシ先＝ビルド時に焼き込む）
+#   5. ACR でイメージをビルド＆プッシュ（クラウドビルド。ローカル Docker 不要）
+#   6. アプリデプロイ（backend=内部 / frontend=公開）
+#
+# 事前準備（1回だけ）: infra/setup-azure-oidc.sh を実行し、出力された値を
+#   GitHub の Secrets（AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID）に登録する。
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "infra/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {} # 手動実行も可能
+
+permissions:
+  id-token: write # OIDC トークン取得に必須
+  contents: read
+
+env:
+  LOCATION: japaneast
+  RESOURCE_GROUP: tracewise-rg
+  NAME_PREFIX: tracewise
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v4
+
+      - name: Azure へログイン（OIDC）
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: リソースグループ作成（冪等）
+        run: az group create -n "$RESOURCE_GROUP" -l "$LOCATION" -o none
+
+      - name: 基盤デプロイ（platform.bicep）
+        id: platform
+        run: |
+          outputs=$(az deployment group create \
+            -g "$RESOURCE_GROUP" \
+            -n "platform-${{ github.run_number }}" \
+            -f infra/platform.bicep \
+            -p namePrefix="$NAME_PREFIX" location="$LOCATION" \
+            --query properties.outputs -o json)
+          echo "acrName=$(echo "$outputs" | jq -r .acrName.value)" >> "$GITHUB_OUTPUT"
+          echo "acrLoginServer=$(echo "$outputs" | jq -r .acrLoginServer.value)" >> "$GITHUB_OUTPUT"
+          echo "envId=$(echo "$outputs" | jq -r .envId.value)" >> "$GITHUB_OUTPUT"
+          echo "envDefaultDomain=$(echo "$outputs" | jq -r .envDefaultDomain.value)" >> "$GITHUB_OUTPUT"
+          echo "envStorageName=$(echo "$outputs" | jq -r .envStorageName.value)" >> "$GITHUB_OUTPUT"
+          echo "pullIdentityId=$(echo "$outputs" | jq -r .pullIdentityId.value)" >> "$GITHUB_OUTPUT"
+
+      - name: イメージタグと backend オリジンを決定
+        id: vars
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # backend の内部 FQDN は <app>.internal.<env既定ドメイン> で決定論的に決まる。
+          echo "backendOrigin=https://${NAME_PREFIX}-backend.internal.${{ steps.platform.outputs.envDefaultDomain }}" >> "$GITHUB_OUTPUT"
+
+      - name: backend イメージを ACR でビルド＆プッシュ
+        run: |
+          az acr build \
+            -r "${{ steps.platform.outputs.acrName }}" \
+            -t "tracewise-backend:${{ steps.vars.outputs.tag }}" \
+            -t "tracewise-backend:latest" \
+            -f backend/Dockerfile.prod \
+            backend
+
+      - name: frontend イメージを ACR でビルド＆プッシュ（プロキシ先を build-arg 注入）
+        run: |
+          # NODE_ENV=production のためブラウザは同一オリジンの /api を叩く（相対）。
+          # BACKEND_ORIGIN → Next.js の rewrites が backend(内部) へ中継する宛先（ビルド時に焼き込む）。
+          az acr build \
+            -r "${{ steps.platform.outputs.acrName }}" \
+            -t "tracewise-frontend:${{ steps.vars.outputs.tag }}" \
+            -t "tracewise-frontend:latest" \
+            -f frontend/Dockerfile.prod \
+            --build-arg BACKEND_ORIGIN="${{ steps.vars.outputs.backendOrigin }}" \
+            frontend
+
+      - name: アプリデプロイ（apps.bicep）
+        id: apps
+        run: |
+          loginServer="${{ steps.platform.outputs.acrLoginServer }}"
+          tag="${{ steps.vars.outputs.tag }}"
+          outputs=$(az deployment group create \
+            -g "$RESOURCE_GROUP" \
+            -n "apps-${{ github.run_number }}" \
+            -f infra/apps.bicep \
+            -p namePrefix="$NAME_PREFIX" \
+               location="$LOCATION" \
+               envId="${{ steps.platform.outputs.envId }}" \
+               acrLoginServer="$loginServer" \
+               pullIdentityId="${{ steps.platform.outputs.pullIdentityId }}" \
+               envStorageName="${{ steps.platform.outputs.envStorageName }}" \
+               backendImage="$loginServer/tracewise-backend:$tag" \
+               frontendImage="$loginServer/tracewise-frontend:$tag" \
+            --query properties.outputs -o json)
+          echo "frontendUrl=$(echo "$outputs" | jq -r .frontendUrl.value)" >> "$GITHUB_OUTPUT"
+
+      - name: デプロイ結果を表示
+        run: |
+          {
+            echo "### デプロイ完了 :rocket:"
+            echo ""
+            echo "- フロントエンド: ${{ steps.apps.outputs.frontendUrl }}"
+            echo "- イメージタグ: \`${{ steps.vars.outputs.tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

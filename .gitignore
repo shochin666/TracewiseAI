@@ -1,0 +1,32 @@
+# --- Python / backend ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+# SQLite DB（実行時に生成。サンプルデータは seed で再投入できる）
+backend/data/*.db
+backend/data/*.sqlite3
+
+# --- Node / frontend ---
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# --- 環境変数 ---
+.env
+.env.local
+.env.*.local
+
+# --- OS / エディタ ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# QRラベルのサンプル画像（tools/qr/output/*.png）はデモ成果物として
+# リポジトリに含めるため ignore しない。
+*.zip

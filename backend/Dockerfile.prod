@@ -1,0 +1,30 @@
+# 本番用イメージ（ホットリロード無し）。Azure Container Apps 等へのデプロイ用。
+# ローカル開発は従来どおり backend/Dockerfile（--reload）と docker-compose を使う。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# 依存だけ先に入れてレイヤキャッシュを効かせる（requirements.txt 変更時のみ再取得）。
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# アプリ本体
+COPY app ./app
+
+# SQLite の保存先。本番は Azure Files をこのパスにマウントして永続化する。
+#  - 注意1: Azure Files(SMB) 上では WAL を使わない（共有メモリ非対応のため）。
+#           既定のロールバックジャーナルのまま運用する。
+#  - 注意2: SMB マウントへの書き込み互換性のため、あえて非 root 化していない。
+#           backend は内部 Ingress のみで公開しない前提。
+ENV TRACEWISE_DB_PATH=/app/data/tracewise.db
+RUN mkdir -p /app/data
+
+EXPOSE 8000
+
+# 本番起動: --reload 無し。SQLite は単一ライタ前提のため worker は 1 に固定する
+# （複数 worker / 複数レプリカは DB 破損の恐れ。スケールは frontend 側で行う）。
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

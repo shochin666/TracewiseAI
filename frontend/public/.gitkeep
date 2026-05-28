@@ -1,0 +1,1 @@
+# Next.js standalone ビルドが public/ をコピーするため、空でも存在させておく。

@@ -1,0 +1,17 @@
+# ホスト側の生成物・仮想環境はイメージに含めない
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+
+# 開発用SQLite（コンテナ側で起動時にseedされる。compose側でvolumeマウント）
+data/*.db
+data/*.sqlite3
+
+# 環境・メタ
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md

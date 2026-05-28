@@ -1,0 +1,45 @@
+# ねじメッキ工程 不具合登録・AI原因分析システム（デモ・開発モード）
+#
+# 起動:
+#   docker compose up           ← 通常はこれだけ。コード編集は再ビルドなしで即反映
+#   docker compose up --build   ← 初回、または依存(package.json / requirements.txt)を変えた時だけ
+#
+#   - バックエンド(API): http://localhost:8000  (/docs でAPIドキュメント)
+#   - フロントエンド    : http://localhost:3000
+#
+# ソースをマウントして起動するため、.py / .tsx を編集すると自動で反映されます
+# （フロント=Next.js dev、バックエンド=uvicorn --reload）。本番ビルドは行いません。
+
+services:
+  backend:
+    build: ./backend
+    container_name: tracewise-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - TRACEWISE_DB_PATH=/app/data/tracewise.db
+      - FRONTEND_ORIGIN=http://localhost:3000
+      # macOSのバインドマウントは inotify が伝わらないため、watchfiles をポーリングに。
+      # これが無いと uvicorn --reload が .py の変更を検知できない。
+      - WATCHFILES_FORCE_POLLING=true
+    volumes:
+      - ./backend/app:/app/app      # ソースをマウント → --reload で即反映
+      - ./backend/data:/app/data    # SQLite を永続化（消したい時は backend/data/tracewise.db を削除）
+
+  frontend:
+    build: ./frontend
+    container_name: tracewise-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # 開発サーバが起動時に読む（本番のようなビルド時埋め込みではない）
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+      # macOSのバインドマウントは inotify が伝わらないため、Next.js(webpack)をポーリングに。
+      # これが無いと .tsx 編集が即反映されない。
+      - WATCHPACK_POLLING=true
+    volumes:
+      - ./frontend:/app             # ソースをマウント → 保存で即反映
+      - /app/node_modules           # コンテナ側の node_modules を保持（ホストで上書きしない）
+      - /app/.next                  # devキャッシュはコンテナ側に隔離
+    depends_on:
+      - backend

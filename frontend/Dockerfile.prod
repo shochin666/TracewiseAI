@@ -1,0 +1,49 @@
+# 本番用イメージ（Next.js standalone 出力）。Azure Container Apps 等へのデプロイ用。
+# ローカル開発は従来どおり frontend/Dockerfile（next dev）と docker-compose を使う。
+
+# 1) 依存インストール ------------------------------------------------------
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# 2) ビルド ----------------------------------------------------------------
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# ブラウザの API ベースURLは未指定でよい。next build は NODE_ENV=production のため
+# API_BASE は自動的に "" (相対) になり、同一オリジンの /api を叩く
+# （Next.js の rewrites が backend(内部Ingress)へ中継する）。
+#
+# rewrites のプロキシ先 backend オリジン。
+# output:"standalone" では rewrites はビルド時に確定するため、ここで渡して焼き込む。
+ARG BACKEND_ORIGIN=""
+ENV BACKEND_ORIGIN=$BACKEND_ORIGIN
+
+RUN npm run build
+
+# 3) 実行（standalone サーバのみを含む最小イメージ）-------------------------
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+# standalone でも念のためランタイムにも渡しておく（挙動差を吸収する保険）。
+ARG BACKEND_ORIGIN=""
+ENV BACKEND_ORIGIN=$BACKEND_ORIGIN
+
+# 非 root 実行
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
+
+# standalone 出力（server.js + 最小 node_modules）と静的アセットを配置。
+# standalone には public / .next/static が含まれないため個別にコピーする。
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]
