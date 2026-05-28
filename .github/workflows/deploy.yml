@@ -94,26 +94,28 @@ jobs:
           # backend の内部 FQDN は <app>.internal.<env既定ドメイン> で決定論的に決まる。
           echo "backendOrigin=https://${NAME_PREFIX}-backend.internal.${{ steps.platform.outputs.envDefaultDomain }}" >> "$GITHUB_OUTPUT"
 
-      - name: backend イメージを ACR でビルド＆プッシュ
-        run: |
-          az acr build \
-            -r "${{ steps.platform.outputs.acrName }}" \
-            -t "${NAME_PREFIX}-backend:${{ steps.vars.outputs.tag }}" \
-            -t "${NAME_PREFIX}-backend:latest" \
-            -f backend/Dockerfile.prod \
-            backend
+      - name: ACR にログイン（OIDC セッションから docker 認証へ）
+        run: az acr login --name "${{ steps.platform.outputs.acrName }}"
 
-      - name: frontend イメージを ACR でビルド＆プッシュ（プロキシ先を build-arg 注入）
+      - name: backend イメージをビルド＆ACR へ push
+        run: |
+          IMAGE="${{ steps.platform.outputs.acrLoginServer }}/${NAME_PREFIX}-backend"
+          TAG="${{ steps.vars.outputs.tag }}"
+          docker build -f backend/Dockerfile.prod -t "$IMAGE:$TAG" -t "$IMAGE:latest" backend
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+
+      - name: frontend イメージをビルド＆ACR へ push（プロキシ先を build-arg 注入）
         run: |
           # NODE_ENV=production のためブラウザは同一オリジンの /api を叩く（相対）。
           # BACKEND_ORIGIN → Next.js の rewrites が backend(内部) へ中継する宛先（ビルド時に焼き込む）。
-          az acr build \
-            -r "${{ steps.platform.outputs.acrName }}" \
-            -t "${NAME_PREFIX}-frontend:${{ steps.vars.outputs.tag }}" \
-            -t "${NAME_PREFIX}-frontend:latest" \
-            -f frontend/Dockerfile.prod \
+          IMAGE="${{ steps.platform.outputs.acrLoginServer }}/${NAME_PREFIX}-frontend"
+          TAG="${{ steps.vars.outputs.tag }}"
+          docker build -f frontend/Dockerfile.prod \
             --build-arg BACKEND_ORIGIN="${{ steps.vars.outputs.backendOrigin }}" \
-            frontend
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" frontend
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
 
       - name: アプリデプロイ（apps.bicep）
         id: apps
